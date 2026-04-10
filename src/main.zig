@@ -14,6 +14,7 @@ const ImportLine = struct {
     lhs: []const u8,
     path: []const u8,
     kind: ImportKind,
+    is_direct_import: bool,
     line_index: usize,
 };
 
@@ -32,6 +33,37 @@ fn nodeSource(tree: Ast, node: Ast.Node.Index) []const u8 {
     return tree.source[start..end];
 }
 
+fn parseImportPath(init_src: []const u8) ?struct {
+    path: []const u8,
+    is_direct_import: bool,
+} {
+    const prefix = "@import(";
+    if (!std.mem.startsWith(u8, init_src, prefix)) return null;
+
+    var i: usize = prefix.len;
+    while (i < init_src.len and std.ascii.isWhitespace(init_src[i])) : (i += 1) {}
+    if (i >= init_src.len or init_src[i] != '"') return null;
+    i += 1;
+
+    const path_start = i;
+    while (i < init_src.len and init_src[i] != '"') : (i += 1) {}
+    if (i >= init_src.len) return null;
+
+    const path = init_src[path_start..i];
+    i += 1;
+
+    while (i < init_src.len and std.ascii.isWhitespace(init_src[i])) : (i += 1) {}
+    if (i >= init_src.len or init_src[i] != ')') return null;
+    i += 1;
+
+    while (i < init_src.len and std.ascii.isWhitespace(init_src[i])) : (i += 1) {}
+
+    return .{
+        .path = path,
+        .is_direct_import = i == init_src.len,
+    };
+}
+
 fn parseImportDecl(tree: Ast, node: Ast.Node.Index, line: []const u8, line_index: usize) ?ImportLine {
     const var_decl = tree.fullVarDecl(node) orelse return null;
     if (tree.tokenTag(var_decl.ast.mut_token) != .keyword_const) return null;
@@ -41,45 +73,29 @@ fn parseImportDecl(tree: Ast, node: Ast.Node.Index, line: []const u8, line_index
     const lhs = tree.tokenSlice(lhs_token);
 
     const init_node = var_decl.ast.init_node.unwrap() orelse return null;
-    const init_tag = tree.nodeTag(init_node);
+    const init_src = nodeSource(tree, init_node);
 
-    switch (init_tag) {
-        .builtin_call,
-        .builtin_call_comma,
-        .builtin_call_two,
-        .builtin_call_two_comma,
-        => {
-            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(init_node)), "@import")) return null;
-
-            var buffer: [2]Ast.Node.Index = undefined;
-            const params = tree.builtinCallParams(&buffer, init_node) orelse return null;
-            if (params.len != 1) return null;
-
-            const arg_src = nodeSource(tree, params[0]);
-            if (arg_src.len < 2 or arg_src[0] != '"' or arg_src[arg_src.len - 1] != '"') return null;
-            const path = arg_src[1 .. arg_src.len - 1];
-
-            return .{
-                .line = line,
-                .lhs = lhs,
-                .path = path,
-                .kind = classifyPath(path),
-                .line_index = line_index,
-            };
-        },
-        else => {
-            const init_src = nodeSource(tree, init_node);
-            if (!std.mem.startsWith(u8, init_src, "std.")) return null;
-
-            return .{
-                .line = line,
-                .lhs = lhs,
-                .path = "",
-                .kind = .std_use,
-                .line_index = line_index,
-            };
-        },
+    if (parseImportPath(init_src)) |parsed_import| {
+        return .{
+            .line = line,
+            .lhs = lhs,
+            .path = parsed_import.path,
+            .kind = classifyPath(parsed_import.path),
+            .is_direct_import = parsed_import.is_direct_import,
+            .line_index = line_index,
+        };
     }
+
+    if (!std.mem.startsWith(u8, init_src, "std.")) return null;
+
+    return .{
+        .line = line,
+        .lhs = lhs,
+        .path = "",
+        .kind = .std_use,
+        .is_direct_import = true,
+        .line_index = line_index,
+    };
 }
 
 fn isIdentChar(ch: u8) bool {
@@ -125,7 +141,21 @@ fn sortByPath(items: []ImportLine) void {
     var i: usize = 1;
     while (i < items.len) : (i += 1) {
         var j = i;
-        while (j > 0 and std.mem.order(u8, items[j - 1].path, items[j].path) == .gt) : (j -= 1) {
+        while (j > 0) : (j -= 1) {
+            const prev = items[j - 1];
+            const curr = items[j];
+
+            const path_order = std.mem.order(u8, prev.path, curr.path);
+            const should_swap = switch (path_order) {
+                .gt => true,
+                .lt => false,
+                .eq => if (prev.is_direct_import != curr.is_direct_import)
+                    !prev.is_direct_import and curr.is_direct_import
+                else
+                    std.mem.order(u8, prev.lhs, curr.lhs) == .gt,
+            };
+
+            if (!should_swap) break;
             std.mem.swap(ImportLine, &items[j - 1], &items[j]);
         }
     }
@@ -622,6 +652,54 @@ test "test fimpo" {
         \\}
     ;
 
+    const in9 =
+        \\const foo = @import("foo");
+        \\const std = @import("std");
+        \\const tt = @import("../tt.zig");
+        \\const xBeta = @import("../beta.zig").x;
+        \\const alpha = @import("alpha.zig");
+        \\const beta = @import("../beta.zig");
+        \\const byAlpha = @import("alpha.zig").by;
+        \\
+        \\pub const T = @This();
+        \\
+        \\const byBeta = @import("../beta.zig").by;
+        \\
+        \\fn render() []const u8 {
+        \\    return fmt.comptimePrint("{s}", .{"x"});
+        \\}
+        \\
+        \\const testing = std.testing;
+        \\test "last" {
+        \\    try testing.expect(true);
+        \\}
+    ;
+    const out9 =
+        \\const std = @import("std");
+        \\
+        \\const foo = @import("foo");
+        \\
+        \\const alpha = @import("alpha.zig");
+        \\const byAlpha = @import("alpha.zig").by;
+        \\
+        \\const beta = @import("../beta.zig");
+        \\const xBeta = @import("../beta.zig").x;
+        \\const tt = @import("../tt.zig");
+        \\
+        \\pub const T = @This();
+        \\
+        \\const byBeta = @import("../beta.zig").by;
+        \\
+        \\fn render() []const u8 {
+        \\    return fmt.comptimePrint("{s}", .{"x"});
+        \\}
+        \\
+        \\const testing = std.testing;
+        \\test "last" {
+        \\    try testing.expect(true);
+        \\}
+    ;
+
     try expectFormatted(in1, out1);
     try expectFormatted(in2, out2);
     try expectFormatted(in3, out3);
@@ -630,4 +708,5 @@ test "test fimpo" {
     try expectFormatted(in6, out6);
     try expectFormatted(in7, out7);
     try expectFormatted(in8, out8);
+    try expectFormatted(in9, out9);
 }
