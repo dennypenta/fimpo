@@ -82,6 +82,35 @@ fn parseImportDecl(tree: Ast, node: Ast.Node.Index, line: []const u8, line_index
     }
 }
 
+fn isIdentChar(ch: u8) bool {
+    return (ch >= 'a' and ch <= 'z') or
+        (ch >= 'A' and ch <= 'Z') or
+        (ch >= '0' and ch <= '9') or
+        ch == '_';
+}
+
+fn containsIdent(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return false;
+
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, search_from, needle)) |idx| {
+        const before_ok = idx == 0 or !isIdentChar(haystack[idx - 1]);
+        const after_idx = idx + needle.len;
+        const after_ok = after_idx == haystack.len or !isIdentChar(haystack[after_idx]);
+        if (before_ok and after_ok) return true;
+        search_from = idx + needle.len;
+    }
+
+    return false;
+}
+
+fn usesAnyImport(decl_src: []const u8, imported_names: []const []const u8) bool {
+    for (imported_names) |name| {
+        if (containsIdent(decl_src, name)) return true;
+    }
+    return false;
+}
+
 fn sortByLhs(items: []ImportLine) void {
     var i: usize = 1;
     while (i < items.len) : (i += 1) {
@@ -175,6 +204,9 @@ pub fn formatImports(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     var body_lines = std.ArrayList([]const u8).empty;
     defer body_lines.deinit(allocator);
 
+    var imported_names = std.ArrayList([]const u8).empty;
+    defer imported_names.deinit(allocator);
+
     var all_lines = std.ArrayList([]const u8).empty;
     defer all_lines.deinit(allocator);
     var line_starts = std.ArrayList(usize).empty;
@@ -193,6 +225,8 @@ pub fn formatImports(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     @memset(is_import_line, false);
 
     var line_cursor: usize = 0;
+    var import_block_started = false;
+    var import_block_ended = false;
     for (tree.rootDecls()) |decl| {
         const first_tok = tree.firstToken(decl);
         const decl_start = @as(usize, tree.tokenStart(first_tok));
@@ -210,8 +244,21 @@ pub fn formatImports(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
             continue;
         }
 
-        const parsed = parseImportDecl(tree, decl, line, line_cursor) orelse continue;
+        if (import_block_ended) continue;
+
+        const parsed = parseImportDecl(tree, decl, line, line_cursor) orelse {
+            if (import_block_started and tree.fullVarDecl(decl) != null) {
+                const decl_src = nodeSource(tree, decl);
+                if (!usesAnyImport(decl_src, imported_names.items)) {
+                    import_block_ended = true;
+                }
+            }
+            continue;
+        };
+
+        import_block_started = true;
         is_import_line[parsed.line_index] = true;
+        try imported_names.append(allocator, parsed.lhs);
 
         switch (parsed.kind) {
             .std_root => try std_roots.append(allocator, parsed),
@@ -277,12 +324,17 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     if (args.len > 2) {
-        const stderr = std.io.getStdErr().writer();
+        var stdout_buffer: [1024]u8 = undefined;
+        var writer = std.fs.File.stderr().writer(&stdout_buffer);
+        const stderr = &writer.interface;
+
         try stderr.print("Usage: {s} [path-to-file]\n", .{args[0]});
         return error.InvalidArguments;
     }
 
     if (args.len == 2) {
+        std.debug.print("args: {s}\n", .{args[1]});
+
         const path = args[1];
         const input = try readInputFromPath(allocator, path, max_input_bytes);
         defer allocator.free(input);
@@ -294,14 +346,19 @@ pub fn main() !void {
         return;
     }
 
-    const stdin = std.io.getStdIn().reader();
-    const input = try stdin.readAllAlloc(allocator, max_input_bytes);
+    var stdin_buffer: [1024]u8 = undefined;
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdinReader = std.fs.File.stdin().reader(&stdin_buffer);
+    var stdoutWriter = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdin = &stdinReader.interface;
+    const stdout = &stdoutWriter.interface;
+
+    const input = try stdin.readAlloc(allocator, max_input_bytes);
     defer allocator.free(input);
 
     const output = try formatImports(allocator, input);
     defer allocator.free(output);
 
-    const stdout = std.io.getStdOut().writer();
     try stdout.writeAll(output);
 }
 
@@ -503,6 +560,68 @@ test "test fimpo" {
         \\}
     ;
 
+    const in8 =
+        \\const std = @import("std");
+        \\const Allocator = std.mem.Allocator;
+        \\
+        \\const Filenames = @import("../../Filenames.zig");
+        \\const fs = @import("../../fs.zig");
+        \\const MemTable = @import("../inmem/MemTable.zig");
+        \\const DiskTable = @import("DiskTable.zig");
+        \\const IndexBlockHeader = @import("../inmem/IndexBlockHeader.zig");
+        \\const TableHeader = @import("../inmem/TableHeader.zig");
+        \\const ColumnIDGen = @import("../inmem/ColumnIDGen.zig");
+        \\const encoding = @import("encoding");
+        \\
+        \\const catalog = @import("../table/catalog.zig");
+        \\
+        \\const Table = @This();
+        \\
+        \\disk: ?*DiskTable,
+        \\mem: ?*MemTable,
+        \\
+        \\pub fn do(self: *Table) void {
+        \\    _ = self;
+        \\}
+        \\
+        \\const testing = std.testing;
+        \\
+        \\test "test doing" {
+        \\    try testing.expect(true);
+        \\}
+    ;
+    const out8 =
+        \\const std = @import("std");
+        \\const Allocator = std.mem.Allocator;
+        \\
+        \\const encoding = @import("encoding");
+        \\
+        \\const DiskTable = @import("DiskTable.zig");
+        \\
+        \\const Filenames = @import("../../Filenames.zig");
+        \\const fs = @import("../../fs.zig");
+        \\const ColumnIDGen = @import("../inmem/ColumnIDGen.zig");
+        \\const IndexBlockHeader = @import("../inmem/IndexBlockHeader.zig");
+        \\const MemTable = @import("../inmem/MemTable.zig");
+        \\const TableHeader = @import("../inmem/TableHeader.zig");
+        \\const catalog = @import("../table/catalog.zig");
+        \\
+        \\const Table = @This();
+        \\
+        \\disk: ?*DiskTable,
+        \\mem: ?*MemTable,
+        \\
+        \\pub fn do(self: *Table) void {
+        \\    _ = self;
+        \\}
+        \\
+        \\const testing = std.testing;
+        \\
+        \\test "test doing" {
+        \\    try testing.expect(true);
+        \\}
+    ;
+
     try expectFormatted(in1, out1);
     try expectFormatted(in2, out2);
     try expectFormatted(in3, out3);
@@ -510,4 +629,5 @@ test "test fimpo" {
     try expectFormatted(in5, out5);
     try expectFormatted(in6, out6);
     try expectFormatted(in7, out7);
+    try expectFormatted(in8, out8);
 }
