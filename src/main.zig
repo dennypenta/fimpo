@@ -4,9 +4,10 @@ const Ast = std.zig.Ast;
 const ImportKind = enum {
     std_root,
     std_use,
+    builtin,
     third_party,
-    local,
     relative,
+    local,
 };
 
 const ImportLine = struct {
@@ -20,6 +21,7 @@ const ImportLine = struct {
 
 fn classifyPath(path: []const u8) ImportKind {
     if (std.mem.eql(u8, path, "std")) return .std_root;
+    if (std.mem.eql(u8, path, "builtin")) return .builtin;
     if (!std.mem.endsWith(u8, path, ".zig")) return .third_party;
     if (std.mem.indexOfScalar(u8, path, '/')) |_| return .relative;
     return .local;
@@ -224,6 +226,8 @@ pub fn formatImports(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     defer std_roots.deinit(allocator);
     var std_uses = std.ArrayList(ImportLine).empty;
     defer std_uses.deinit(allocator);
+    var builtins = std.ArrayList(ImportLine).empty;
+    defer builtins.deinit(allocator);
     var third_party = std.ArrayList(ImportLine).empty;
     defer third_party.deinit(allocator);
     var local = std.ArrayList(ImportLine).empty;
@@ -293,6 +297,7 @@ pub fn formatImports(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
         switch (parsed.kind) {
             .std_root => try std_roots.append(allocator, parsed),
             .std_use => try std_uses.append(allocator, parsed),
+            .builtin => try builtins.append(allocator, parsed),
             .third_party => try third_party.append(allocator, parsed),
             .local => try local.append(allocator, parsed),
             .relative => try relative.append(allocator, parsed),
@@ -311,9 +316,10 @@ pub fn formatImports(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
 
     sortByLhs(std_roots.items);
     sortByLhs(std_uses.items);
+    sortByPath(builtins.items);
     sortByPath(third_party.items);
-    sortByPath(local.items);
     sortByPath(relative.items);
+    sortByPath(local.items);
 
     var import_lines = std.ArrayList([]const u8).empty;
     defer import_lines.deinit(allocator);
@@ -323,9 +329,15 @@ pub fn formatImports(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
         try appendLines(allocator, &import_lines, std_uses.items);
     }
 
+    try appendGroup(allocator, &import_lines, builtins.items);
     try appendGroup(allocator, &import_lines, third_party.items);
-    try appendGroup(allocator, &import_lines, local.items);
-    try appendGroup(allocator, &import_lines, relative.items);
+    if (std_roots.items.len == 0 and std_uses.items.len == 0 and builtins.items.len == 0 and third_party.items.len == 0 and local.items.len != 0 and relative.items.len != 0) {
+        try appendGroup(allocator, &import_lines, local.items);
+        try appendGroup(allocator, &import_lines, relative.items);
+    } else {
+        try appendGroup(allocator, &import_lines, relative.items);
+        try appendGroup(allocator, &import_lines, local.items);
+    }
 
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -402,6 +414,7 @@ test "test fimpo" {
     const in1 =
         \\const bar = @import("bar.zig");
         \\const fs = std.fs;
+        \\const builtin = @import("builtin");
         \\const zeit = @import("zeit");
         \\const std = @import("std");
         \\
@@ -412,6 +425,8 @@ test "test fimpo" {
     const out1 =
         \\const std = @import("std");
         \\const fs = std.fs;
+        \\
+        \\const builtin = @import("builtin");
         \\
         \\const zeit = @import("zeit");
         \\
@@ -465,9 +480,9 @@ test "test fimpo" {
         \\
         \\const foo = @import("foo");
         \\
-        \\const bar = @import("bar.zig");
-        \\
         \\const node = @import("tree/node.zig");
+        \\
+        \\const bar = @import("bar.zig");
         \\
         \\test "tiny" {
         \\    try testing.expect(mem.eql(u8, "a", "a"));
@@ -491,9 +506,9 @@ test "test fimpo" {
         \\
         \\const foo = @import("vendor");
         \\
-        \\const baz = @import("baz.zig");
-        \\
         \\const fax = @import("../fax.zig");
+        \\
+        \\const baz = @import("baz.zig");
         \\
         \\pub const V = struct {
         \\    pub fn ok() bool {
@@ -521,9 +536,9 @@ test "test fimpo" {
         \\
         \\const dep = @import("dep");
         \\
-        \\const bar = @import("bar.zig");
-        \\
         \\const node = @import("tree/node.zig");
+        \\
+        \\const bar = @import("bar.zig");
         \\
         \\fn render() []const u8 {
         \\    return fmt.comptimePrint("{s}", .{"x"});
@@ -547,9 +562,9 @@ test "test fimpo" {
         \\
         \\const foo = @import("foo");
         \\
-        \\const alpha = @import("alpha.zig");
-        \\
         \\const beta = @import("../beta.zig");
+        \\
+        \\const alpha = @import("alpha.zig");
         \\
         \\test "last" {
         \\    try testing.expect(true);
@@ -577,9 +592,9 @@ test "test fimpo" {
         \\
         \\const foo = @import("foo");
         \\
-        \\const alpha = @import("alpha.zig");
-        \\
         \\const beta = @import("../beta.zig");
+        \\
+        \\const alpha = @import("alpha.zig");
         \\
         \\fn render() []const u8 {
         \\    return fmt.comptimePrint("{s}", .{"x"});
@@ -626,8 +641,6 @@ test "test fimpo" {
         \\
         \\const encoding = @import("encoding");
         \\
-        \\const DiskTable = @import("DiskTable.zig");
-        \\
         \\const Filenames = @import("../../Filenames.zig");
         \\const fs = @import("../../fs.zig");
         \\const ColumnIDGen = @import("../inmem/ColumnIDGen.zig");
@@ -635,6 +648,8 @@ test "test fimpo" {
         \\const MemTable = @import("../inmem/MemTable.zig");
         \\const TableHeader = @import("../inmem/TableHeader.zig");
         \\const catalog = @import("../table/catalog.zig");
+        \\
+        \\const DiskTable = @import("DiskTable.zig");
         \\
         \\const Table = @This();
         \\
@@ -679,12 +694,12 @@ test "test fimpo" {
         \\
         \\const foo = @import("foo");
         \\
-        \\const alpha = @import("alpha.zig");
-        \\const byAlpha = @import("alpha.zig").by;
-        \\
         \\const beta = @import("../beta.zig");
         \\const xBeta = @import("../beta.zig").x;
         \\const tt = @import("../tt.zig");
+        \\
+        \\const alpha = @import("alpha.zig");
+        \\const byAlpha = @import("alpha.zig").by;
         \\
         \\pub const T = @This();
         \\
