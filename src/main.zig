@@ -1,4 +1,5 @@
 const std = @import("std");
+const Ast = std.zig.Ast;
 
 const ImportKind = enum {
     std_root,
@@ -13,47 +14,72 @@ const ImportLine = struct {
     lhs: []const u8,
     path: []const u8,
     kind: ImportKind,
+    line_index: usize,
 };
 
-fn parseImportLine(line: []const u8) ?ImportLine {
-    if (line.len == 0) return null;
-    if (line[0] == ' ' or line[0] == '\t') return null;
+fn classifyPath(path: []const u8) ImportKind {
+    if (std.mem.eql(u8, path, "std")) return .std_root;
+    if (!std.mem.endsWith(u8, path, ".zig")) return .third_party;
+    if (std.mem.indexOfScalar(u8, path, '/')) |_| return .relative;
+    return .local;
+}
 
-    const prefix = "const ";
-    if (!std.mem.startsWith(u8, line, prefix)) return null;
+fn nodeSource(tree: Ast, node: Ast.Node.Index) []const u8 {
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    const start = tree.tokenStart(first);
+    const end = tree.tokenStart(last) + @as(u32, @intCast(tree.tokenSlice(last).len));
+    return tree.source[start..end];
+}
 
-    const eq_marker = " = ";
-    const eq_idx = std.mem.indexOf(u8, line, eq_marker) orelse return null;
-    const lhs = line[prefix.len..eq_idx];
-    const rhs = line[eq_idx + eq_marker.len ..];
+fn parseImportDecl(tree: Ast, node: Ast.Node.Index, line: []const u8, line_index: usize) ?ImportLine {
+    const var_decl = tree.fullVarDecl(node) orelse return null;
+    if (tree.tokenTag(var_decl.ast.mut_token) != .keyword_const) return null;
 
-    if (!std.mem.endsWith(u8, rhs, ";")) return null;
-    const rhs_body = rhs[0 .. rhs.len - 1];
+    const lhs_token = var_decl.ast.mut_token + 1;
+    if (tree.tokenTag(lhs_token) != .identifier) return null;
+    const lhs = tree.tokenSlice(lhs_token);
 
-    const import_prefix = "@import(\"";
-    if (std.mem.startsWith(u8, rhs_body, import_prefix) and std.mem.endsWith(u8, rhs_body, "\")")) {
-        const path = rhs_body[import_prefix.len .. rhs_body.len - 2];
+    const init_node = var_decl.ast.init_node.unwrap() orelse return null;
+    const init_tag = tree.nodeTag(init_node);
 
-        if (std.mem.eql(u8, path, "std")) {
-            return .{ .line = line, .lhs = lhs, .path = path, .kind = .std_root };
-        }
+    switch (init_tag) {
+        .builtin_call,
+        .builtin_call_comma,
+        .builtin_call_two,
+        .builtin_call_two_comma,
+        => {
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(init_node)), "@import")) return null;
 
-        if (!std.mem.endsWith(u8, path, ".zig")) {
-            return .{ .line = line, .lhs = lhs, .path = path, .kind = .third_party };
-        }
+            var buffer: [2]Ast.Node.Index = undefined;
+            const params = tree.builtinCallParams(&buffer, init_node) orelse return null;
+            if (params.len != 1) return null;
 
-        if (std.mem.indexOfScalar(u8, path, '/')) |_| {
-            return .{ .line = line, .lhs = lhs, .path = path, .kind = .relative };
-        }
+            const arg_src = nodeSource(tree, params[0]);
+            if (arg_src.len < 2 or arg_src[0] != '"' or arg_src[arg_src.len - 1] != '"') return null;
+            const path = arg_src[1 .. arg_src.len - 1];
 
-        return .{ .line = line, .lhs = lhs, .path = path, .kind = .local };
+            return .{
+                .line = line,
+                .lhs = lhs,
+                .path = path,
+                .kind = classifyPath(path),
+                .line_index = line_index,
+            };
+        },
+        else => {
+            const init_src = nodeSource(tree, init_node);
+            if (!std.mem.startsWith(u8, init_src, "std.")) return null;
+
+            return .{
+                .line = line,
+                .lhs = lhs,
+                .path = "",
+                .kind = .std_use,
+                .line_index = line_index,
+            };
+        },
     }
-
-    if (std.mem.startsWith(u8, rhs_body, "std.")) {
-        return .{ .line = line, .lhs = lhs, .path = "", .kind = .std_use };
-    }
-
-    return null;
 }
 
 fn sortByLhs(items: []ImportLine) void {
@@ -102,6 +128,16 @@ fn appendJoined(allocator: std.mem.Allocator, builder: *std.ArrayList(u8), lines
 }
 
 pub fn formatImports(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const source_z = try allocator.dupeZ(u8, input);
+    defer allocator.free(source_z);
+
+    var tree = try Ast.parse(allocator, source_z, .zig);
+    defer tree.deinit(allocator);
+
+    if (tree.errors.len != 0) {
+        return allocator.dupe(u8, input);
+    }
+
     var std_roots = std.ArrayList(ImportLine).empty;
     defer std_roots.deinit(allocator);
     var std_uses = std.ArrayList(ImportLine).empty;
@@ -112,21 +148,59 @@ pub fn formatImports(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     defer local.deinit(allocator);
     var relative = std.ArrayList(ImportLine).empty;
     defer relative.deinit(allocator);
+
     var body_lines = std.ArrayList([]const u8).empty;
     defer body_lines.deinit(allocator);
 
+    var all_lines = std.ArrayList([]const u8).empty;
+    defer all_lines.deinit(allocator);
+    var line_starts = std.ArrayList(usize).empty;
+    defer line_starts.deinit(allocator);
+
     var line_it = std.mem.splitScalar(u8, input, '\n');
+    var byte_pos: usize = 0;
     while (line_it.next()) |line| {
-        const parsed = parseImportLine(line);
-        if (parsed) |entry| {
-            switch (entry.kind) {
-                .std_root => try std_roots.append(allocator, entry),
-                .std_use => try std_uses.append(allocator, entry),
-                .third_party => try third_party.append(allocator, entry),
-                .local => try local.append(allocator, entry),
-                .relative => try relative.append(allocator, entry),
-            }
-        } else {
+        try all_lines.append(allocator, line);
+        try line_starts.append(allocator, byte_pos);
+        byte_pos += line.len + 1;
+    }
+
+    const is_import_line = try allocator.alloc(bool, all_lines.items.len);
+    defer allocator.free(is_import_line);
+    @memset(is_import_line, false);
+
+    var line_cursor: usize = 0;
+    for (tree.rootDecls()) |decl| {
+        const first_tok = tree.firstToken(decl);
+        const decl_start = @as(usize, tree.tokenStart(first_tok));
+
+        while (line_cursor + 1 < line_starts.items.len and line_starts.items[line_cursor + 1] <= decl_start) {
+            line_cursor += 1;
+        }
+        if (line_cursor >= all_lines.items.len) continue;
+
+        const line = all_lines.items[line_cursor];
+        if (std.mem.indexOfScalar(u8, line, '\r')) |_| {
+            continue;
+        }
+        if (std.mem.indexOfScalar(u8, line, '\n')) |_| {
+            continue;
+        }
+
+        const parsed = parseImportDecl(tree, decl, line, line_cursor) orelse continue;
+        is_import_line[parsed.line_index] = true;
+
+        switch (parsed.kind) {
+            .std_root => try std_roots.append(allocator, parsed),
+            .std_use => try std_uses.append(allocator, parsed),
+            .third_party => try third_party.append(allocator, parsed),
+            .local => try local.append(allocator, parsed),
+            .relative => try relative.append(allocator, parsed),
+        }
+    }
+
+    for (all_lines.items, 0..) |line, idx| {
+        if (!is_import_line[idx]) {
             try body_lines.append(allocator, line);
         }
     }
