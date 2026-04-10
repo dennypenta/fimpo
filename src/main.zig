@@ -127,6 +127,29 @@ fn appendJoined(allocator: std.mem.Allocator, builder: *std.ArrayList(u8), lines
     }
 }
 
+fn readInputFromPath(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+    const file = blk: {
+        if (std.fs.path.isAbsolute(path)) {
+            break :blk try std.fs.openFileAbsolute(path, .{});
+        }
+        break :blk try std.fs.cwd().openFile(path, .{});
+    };
+
+    defer file.close();
+    return try file.readToEndAlloc(allocator, max_bytes);
+}
+
+fn writeOutputToPath(path: []const u8, data: []const u8) !void {
+    const file = blk: {
+        if (std.fs.path.isAbsolute(path)) {
+            break :blk try std.fs.createFileAbsolute(path, .{ .truncate = true });
+        }
+        break :blk try std.fs.cwd().createFile(path, .{ .truncate = true });
+    };
+    defer file.close();
+    try file.writeAll(data);
+}
+
 pub fn formatImports(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     const source_z = try allocator.dupeZ(u8, input);
     defer allocator.free(source_z);
@@ -249,8 +272,30 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    const max_input_bytes = 16 * 1024 * 1024;
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    if (args.len > 2) {
+        const stderr = std.io.getStdErr().writer();
+        try stderr.print("Usage: {s} [path-to-file]\n", .{args[0]});
+        return error.InvalidArguments;
+    }
+
+    if (args.len == 2) {
+        const path = args[1];
+        const input = try readInputFromPath(allocator, path, max_input_bytes);
+        defer allocator.free(input);
+
+        const output = try formatImports(allocator, input);
+        defer allocator.free(output);
+
+        try writeOutputToPath(path, output);
+        return;
+    }
+
     const stdin = std.io.getStdIn().reader();
-    const input = try stdin.readAllAlloc(allocator, 16 * 1024 * 1024);
+    const input = try stdin.readAllAlloc(allocator, max_input_bytes);
     defer allocator.free(input);
 
     const output = try formatImports(allocator, input);
